@@ -987,12 +987,12 @@ MSHADOW_XINLINE bfloat::bf16_t PosInfValue<bfloat::bf16_t>(void) {
 struct sum {
   /*! \brief do reduction into dst */
   template<typename DType>
-  MSHADOW_XINLINE static void Reduce(volatile DType& dst,  volatile DType src) { // NOLINT(*)
+  MSHADOW_XINLINE static void Reduce(DType& dst,  DType src) { // NOLINT(*)
     dst += src;
   }
   /*! \brief do stable reduction into dst */
   template<typename DType>
-  MSHADOW_XINLINE static void Reduce(volatile DType& dst,  volatile DType src, volatile DType& residual) { // NOLINT(*)
+  MSHADOW_XINLINE static void Reduce(DType& dst,  DType src, DType& residual) { // NOLINT(*)
     DType y = src - residual;
     DType t = dst + y;
     if (isinf_typed::IsInf(t)) {
@@ -1004,7 +1004,7 @@ struct sum {
   }
   /*! \brief combine the results of two reducers */
   template<typename DType>
-  MSHADOW_XINLINE static void Merge(volatile DType& dst_val, volatile DType& src_val) { // NOLINT(*)
+  MSHADOW_XINLINE static void Merge(DType& dst_val, DType& src_val) { // NOLINT(*)
     Reduce(dst_val, src_val);
   }
   /*! \brief combine the results of two reducers */
