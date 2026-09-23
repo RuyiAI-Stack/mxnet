@@ -243,6 +243,20 @@ if(MSVC)
 else()
   include(CheckCXXCompilerFlag)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wno-sign-compare")
+  # Math functions that lower to a single hardware instruction (sqrt is the
+  # canonical example) are otherwise compiled with an errno-preserving guard:
+  # frflags / flt.s / fsflags plus a call into libm for negative inputs. Inside
+  # the elementwise operator kernels that guard runs once per element and costs
+  # more than the sqrt itself (perf annotate of category-nn-basic rank 012:
+  # flt.s 14.4% + fsflags 13.6% vs fsqrt.s 16.1%). The operator path never reads
+  # errno -- every errno use in this tree follows a syscall or stdio call, never
+  # a math call -- so request the pure hardware lowering. Unlike -ffast-math
+  # this does not reassociate floating-point arithmetic and does not change
+  # NaN/Inf semantics.
+  check_cxx_compiler_flag("-fno-math-errno" MXNET_COMPILER_HAS_NO_MATH_ERRNO)
+  if(MXNET_COMPILER_HAS_NO_MATH_ERRNO)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-math-errno")
+  endif()
   if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_ASSERTIONS")
