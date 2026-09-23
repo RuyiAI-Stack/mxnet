@@ -30,6 +30,30 @@
 namespace mshadow {
 namespace expr {
 
+/*!
+ * \brief Accumulation step for the axis reducer.
+ *
+ *  `red::sum::Reduce` takes its accumulator as `volatile DType&`, which forces
+ *  the running sum through memory on every reduction step.  For the additive
+ *  reducer a plain register accumulation performs the same `dst += src`
+ *  sequence, in the same order, without the volatile round-trip.  Every other
+ *  reducer keeps the existing `Reducer::Reduce` contract.
+ *
+ *  \note Dropping the `volatile` qualification allows the compiler to contract
+ *  `acc + val` into a fused multiply-add whenever `val` is itself a product,
+ *  as happens for `sum(lhs * rhs)`; the last bits of the result may therefore
+ *  differ from the volatile version.  Callers that need bit-identical output
+ *  across compilers should be aware of this.
+ */
+template<typename DType>
+MSHADOW_XINLINE void ReduceWithAxisStep(red::sum, DType &acc, DType val) {  // NOLINT(*)
+  acc += val;
+}
+template<typename Reducer, typename DType>
+MSHADOW_XINLINE void ReduceWithAxisStep(Reducer, DType &acc, DType val) {  // NOLINT(*)
+  Reducer::Reduce(acc, val);
+}
+
 /*! \brief reduce out the dimension of src labeled by axis.
  *  \tparam Reducer type of reducer
  *  \tparam SrcExp type of source expression
@@ -123,23 +147,44 @@ struct Plan<ReduceWithAxisExp<Reducer, SrcExp, DType, dimsrc, mask, dimdst>, DTy
     index_t x = (i*last_dst_dim_ + j)/trailing_;
     index_t y = (i*last_dst_dim_ + j)%trailing_;
 
+    // Empty reduction: keep the original early-exit semantics (init value for
+    // the value path, 0 for the masked index path) and avoid the pre-loop
+    // decode division when last_ == 0.
+    if (size_ == 0) {
+      if (mask) return static_cast<DType>(0);
+      DType empty_res; Reducer::SetInitValue(empty_res);
+      return empty_res;
+    }
+
+    // Strength-reduced index decode: z = base_z + k*trailing_ with
+    // base_z = x*size_*trailing_ + y, so z/last_ and z%last_ advance by the
+    // constant (q, r) = (trailing_/last_, trailing_%last_) plus a single
+    // carry.  Integer-equivalent to the original per-element z/last_, z%last_
+    // decode, but with no division inside the k loop.
+    const index_t q = trailing_ / last_;
+    const index_t r = trailing_ % last_;
+    index_t zdiv = (x*size_*trailing_ + y) / last_;
+    index_t zmod = (x*size_*trailing_ + y) % last_;
+
     if (mask) {
       index_t idx = 0;
       DType res; Reducer::SetInitValue(res);
       for (index_t k = 0; k < size_; ++k) {
-        index_t z = (x*size_+k)*trailing_+y;
         DType tmp = res;
-        Reducer::Reduce(res, src_.Eval(z/last_, z%last_));
+        ReduceWithAxisStep(Reducer(), res, src_.Eval(zdiv, zmod));
         if (tmp != res && !isnan_typed::IsNan(tmp)) {
           idx = k;
         }
+        zdiv += q; zmod += r;
+        if (zmod >= last_) { zmod -= last_; ++zdiv; }
       }
       return static_cast<DType>(static_cast<int>(idx));
     } else {
       DType res; Reducer::SetInitValue(res);
       for (index_t k = 0; k < size_; ++k) {
-        index_t z = (x*size_+k)*trailing_+y;
-        Reducer::Reduce(res, src_.Eval(z/last_, z%last_));
+        ReduceWithAxisStep(Reducer(), res, src_.Eval(zdiv, zmod));
+        zdiv += q; zmod += r;
+        if (zmod >= last_) { zmod -= last_; ++zdiv; }
       }
       return res;
     }
