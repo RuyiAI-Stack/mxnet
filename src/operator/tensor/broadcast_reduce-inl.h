@@ -329,12 +329,31 @@ MSHADOW_XINLINE std::pair<AType, AType> seq_reduce_assign_block(size_t start,
   Shape<ndim> coord;
   AType val, residual{};
   Reducer::SetInitValue(val, residual);
+  // Loop-level strength reduction: seed the coordinate/offset walk once for the
+  // whole block instead of recomputing mxnet_op::unravel(k, rshape) and
+  // mxnet_op::dot(coord, rstride) for every reduce element. Seeding is skipped
+  // for empty blocks so that a zero-sized reduce shape (len == 0, where rshape
+  // may contain a 0) never triggers a division by zero in unravel.
+  index_t off = 0;
+  if (len > 0) {
+    coord = mxnet_op::unravel(start, rshape);
+    off   = mxnet_op::dot(coord, rstride);
+  }
   for (size_t k = start; k < start + len; ++k) {
-    coord      = mxnet_op::unravel(k, rshape);
-    AType temp = OP::Map(big[j + mxnet_op::dot(coord, rstride)]);
+    AType temp = OP::Map(big[j + off]);
     if (IndexOP::do_op)
       IndexOP::Op(&temp, k);
     Reducer::Reduce(val, temp, residual);
+    // Advance to the coordinate of k + 1 (mixed-radix carry from the fastest
+    // dimension), keeping `off` in sync with dot(coord, rstride).
+    for (int i = ndim - 1; i >= 0; --i) {
+      if (++coord[i] < rshape[i]) {
+        off += rstride[i];
+        break;
+      }
+      coord[i] = 0;
+      off -= (rshape[i] - 1) * rstride[i];
+    }
   }
   return std::make_pair(val, residual);
 }
@@ -361,13 +380,27 @@ MSHADOW_XINLINE void seq_reduce_assign(const index_t idx,
   AType val, residual;
   Reducer::SetInitValue(val, residual);
   if (!use_omp) {
+    // Loop-level strength reduction: walk the flat offset into `big`
+    // incrementally (mixed-radix carry starting from the fastest dimension)
+    // instead of recomputing mxnet_op::unravel(k, rshape) and
+    // mxnet_op::dot(coord, rstride) for every reduce element.
+    index_t offset = 0;
+    for (int i = 0; i < ndim; ++i)
+      coord[i] = 0;
     for (size_t k = 0; k < M; ++k) {
-      coord      = mxnet_op::unravel(k, rshape);
-      AType temp = OP::Map(big[j + mxnet_op::dot(coord, rstride)]);
+      AType temp = OP::Map(big[j + offset]);
       // argmin/max, set IndexedNum.idx
       if (IndexOP::do_op)
         IndexOP::Op(&temp, k);
       Reducer::Reduce(val, temp, residual);
+      for (int i = ndim - 1; i >= 0; --i) {
+        if (++coord[i] < rshape[i]) {
+          offset += rstride[i];
+          break;
+        }
+        coord[i] = 0;
+        offset -= (rshape[i] - 1) * rstride[i];
+      }
     }
   } else {
     const int thread_count = engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
