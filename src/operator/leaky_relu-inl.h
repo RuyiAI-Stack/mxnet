@@ -402,6 +402,20 @@ class LeakyReLUOp : public Operator {
         break;
       }
       case leakyrelu::kGELU_ERF: {
+        // Optional vectorized float32 fast path (currently RISC-V RVV only).
+        // It performs a plain store, so it is used only for kWriteTo /
+        // kWriteInplace; every other dtype/req/target falls through to the
+        // original scalar kernel below.
+        if ((req[leakyrelu::kData] == kWriteTo || req[leakyrelu::kData] == kWriteInplace) &&
+            mshadow_op::gelu_erf_grad_vec<xpu, DType>::Launch(s,
+                                                              gdata.size(0) * gdata.size(1) *
+                                                                  gdata.size(2),
+                                                              gdata.dptr_,
+                                                              grad.dptr_,
+                                                              data.dptr_,
+                                                              output.dptr_)) {
+          break;
+        }
         MXNET_ASSIGN_REQ_SWITCH(req[leakyrelu::kData], Req, {
           mxnet_op::Kernel<
               mxnet_op::op_with_req<mxnet_op::backward_grad_tuned<mshadow_op::gelu_erf_grad>, Req>,

@@ -37,6 +37,10 @@
 #include <cuda_fp16.h>
 #endif
 
+#if defined(__riscv) && defined(__riscv_v)
+#include <riscv_vector.h>
+#endif
+
 #define MXNET_HAS_GCD_LCM() 0
 #if __cplusplus >= 201703L
 #ifdef __has_gcd_lcm
@@ -617,7 +621,22 @@ MXNET_UNARY_MATH_OP(softrelu_grad, -math::expm1(-a));
 
 MXNET_UNARY_MATH_OP(erfinv_grad, 0.5 * math::sqrt(PI) * math::exp(math::sqr(a)));
 
-MXNET_UNARY_MATH_OP(erf_grad, 2.0 / math::sqrt(PI) * math::exp(-(a * a)));
+/*! \brief Derivative of the Gauss error function: 2/sqrt(pi) * exp(-a^2).
+ *  The float instantiation keeps the coefficient in float32 (2.0f) so the
+ *  float path no longer promotes to float64 (which emitted a per-element
+ *  fcvt.d.s/fmul.d/fcvt.s.d round-trip on RISC-V). The generic instantiation
+ *  keeps the previous double evaluation for all other dtypes. */
+struct erf_grad : public mxnet_op::tunable {
+  template <typename DType>
+  MSHADOW_XINLINE static DType Map(DType a) {
+    return DType(2.0 / math::sqrt(PI) * math::exp(-(a * a)));
+  }
+};
+
+template <>
+MSHADOW_XINLINE float erf_grad::Map<float>(float a) {
+  return 2.0f / math::sqrt(PI) * math::exp(-(a * a));
+}
 
 MXNET_SIMPLE_UNARY_MATH_OP(erf);
 
@@ -629,6 +648,154 @@ MXNET_BINARY_MATH_OP_NC(gelu_erf_grad,
                         DType(static_cast<float>(b) / static_cast<float>(a) +
                               0.5f * static_cast<float>(a) *
                                   erf_grad::Map(static_cast<float>(a) / SQRT_2) / SQRT_2));
+
+/*!
+ * \brief RVV (RISC-V Vector) float32 fast path for the GELU(erf) backward
+ *        kernel `out[i] = g[i] * gelu_erf_grad(a[i], b[i])` where
+ *        `gelu_erf_grad(a, b) = b/a + 0.5f*a*erf_grad(a/sqrt(2))/sqrt(2)` and
+ *        `erf_grad(t) = 2/sqrt(pi) * exp(-t^2)`.
+ *
+ * The scalar kernel calls libm `expf` once per element and (before the
+ * `erf_grad` float specialization above) promoted the `2.0` coefficient to
+ * float64 per element. This path computes the whole chain with RVV float32
+ * instructions and a self-contained range-reduced vector exponential, so no
+ * per-element libm call and no fp64 round-trip remain.
+ */
+#if defined(__riscv) && defined(__riscv_v)
+
+namespace gelu_erf_grad_rvv {
+
+/*!
+ * \brief Vectorized float32 exponential.
+ *
+ * Cephes-style range reduction: `x = k*ln2_hi + k*ln2_lo + r`, where `k` is
+ * the round-to-nearest integer of `x*log2(e)` and both `ln2` parts are scaled
+ * by that same integer `k`, so `|r| <= ln2/2`. `e^r` is evaluated with a
+ * degree-6 polynomial and the result is scaled by the exact power `2^k`.
+ *
+ * Accuracy: about 1 ULP of the true `expf` over the normal range.
+ * `x <= -87.33654475f` (including `-inf`) is flushed to `0`: libm `expf` is
+ * subnormal or zero there, so the absolute difference stays below `2^-126`.
+ * NaN propagates (a NaN compares unequal to itself).
+ */
+inline vfloat32m1_t exp_f32m1(vfloat32m1_t x, size_t vl) {
+  const vfloat32m1_t log2e  = __riscv_vfmv_v_f_f32m1(1.4426950408889634f, vl);
+  const vfloat32m1_t ln2_hi = __riscv_vfmv_v_f_f32m1(6.93145752e-1f, vl);
+  const vfloat32m1_t ln2_lo = __riscv_vfmv_v_f_f32m1(1.42860677e-6f, vl);
+  /* k = round_to_nearest(x * log2(e)); both ln2 parts are scaled by integer k */
+  vfloat32m1_t kf  = __riscv_vfmul_vv_f32m1(x, log2e, vl);
+  vint32m1_t   k   = __riscv_vfcvt_x_f_v_i32m1(kf, vl);
+  vfloat32m1_t kfl = __riscv_vfcvt_f_x_v_f32m1(k, vl);
+  vfloat32m1_t r   = __riscv_vfsub_vv_f32m1(x, __riscv_vfmul_vv_f32m1(kfl, ln2_hi, vl), vl);
+  r = __riscv_vfsub_vv_f32m1(r, __riscv_vfmul_vv_f32m1(kfl, ln2_lo, vl), vl);
+  /* e^r ~= 1 + r + r^2 * p(r), Cephes float coefficients */
+  vfloat32m1_t p = __riscv_vfmv_v_f_f32m1(1.9875691500E-4f, vl);
+  p = __riscv_vfadd_vf_f32m1(__riscv_vfmul_vv_f32m1(p, r, vl), 1.3981999507E-3f, vl);
+  p = __riscv_vfadd_vf_f32m1(__riscv_vfmul_vv_f32m1(p, r, vl), 8.3334519073E-3f, vl);
+  p = __riscv_vfadd_vf_f32m1(__riscv_vfmul_vv_f32m1(p, r, vl), 4.1665795894E-2f, vl);
+  p = __riscv_vfadd_vf_f32m1(__riscv_vfmul_vv_f32m1(p, r, vl), 1.6666665459E-1f, vl);
+  p = __riscv_vfadd_vf_f32m1(__riscv_vfmul_vv_f32m1(p, r, vl), 5.0000001201E-1f, vl);
+  vfloat32m1_t z = __riscv_vfmul_vv_f32m1(p, r, vl);
+  z = __riscv_vfmul_vv_f32m1(z, r, vl);
+  z = __riscv_vfadd_vv_f32m1(z, r, vl);
+  z = __riscv_vfadd_vf_f32m1(z, 1.0f, vl);
+  /* exact scaling by 2^k */
+  vint32m1_t   e     = __riscv_vsll_vx_i32m1(__riscv_vadd_vx_i32m1(k, 127, vl), 23, vl);
+  vfloat32m1_t scale = __riscv_vreinterpret_v_i32m1_f32m1(e);
+  vfloat32m1_t res   = __riscv_vfmul_vv_f32m1(z, scale, vl);
+  /* underflow (incl. -inf) -> 0, NaN -> NaN */
+  vbool32_t is_under = __riscv_vmfle(x, -87.33654475f, vl);
+  res = __riscv_vfmerge(res, 0.0f, is_under, vl);
+  vbool32_t is_nan = __riscv_vmfne(x, x, vl);
+  res = __riscv_vfmerge(res, __builtin_nanf(""), is_nan, vl);
+  return res;
+}
+
+/*! \brief Process one contiguous block of `vl` float32 elements. */
+inline void gelu_erf_grad_block_f32m1(const float* g,
+                                      const float* a,
+                                      const float* b,
+                                      float* out,
+                                      size_t vl) {
+  const float sqrt2 = SQRT_2;
+  const float coef  = 2.0f / math::sqrt(PI);
+  vfloat32m1_t va = __riscv_vle32_v_f32m1(a, vl);
+  vfloat32m1_t vb = __riscv_vle32_v_f32m1(b, vl);
+  vfloat32m1_t vg = __riscv_vle32_v_f32m1(g, vl);
+  /* t = a / sqrt(2) */
+  vfloat32m1_t t  = __riscv_vfdiv_vf_f32m1(va, sqrt2, vl);
+  /* exp(-t^2) */
+  vfloat32m1_t tt = __riscv_vfmul_vv_f32m1(t, t, vl);
+  vfloat32m1_t x  = __riscv_vfneg_v_f32m1(tt, vl);
+  vfloat32m1_t ex = exp_f32m1(x, vl);
+  /* erf_grad(t) = (2/sqrt(pi)) * exp(-t^2) */
+  vfloat32m1_t eg = __riscv_vfmul_vf_f32m1(ex, coef, vl);
+  /* inner = b/a + (0.5f*a*eg)/sqrt(2) */
+  vfloat32m1_t half_a = __riscv_vfmul_vf_f32m1(va, 0.5f, vl);
+  vfloat32m1_t term   = __riscv_vfmul_vv_f32m1(half_a, eg, vl);
+  term = __riscv_vfdiv_vf_f32m1(term, sqrt2, vl);
+  vfloat32m1_t ba    = __riscv_vfdiv_vv_f32m1(vb, va, vl);
+  vfloat32m1_t inner = __riscv_vfadd_vv_f32m1(ba, term, vl);
+  /* out = g * inner */
+  vfloat32m1_t res = __riscv_vfmul_vv_f32m1(inner, vg, vl);
+  __riscv_vse32_v_f32m1(out, res, vl);
+}
+
+/*! \brief Contiguous float32 gelu_erf_grad backward with a fixed-VL main loop
+ *         and a runtime-VL tail. */
+inline void gelu_erf_grad_f32(const float* g,
+                              const float* a,
+                              const float* b,
+                              float* out,
+                              size_t N) {
+  const size_t vlmax = __riscv_vsetvlmax_e32m1();
+  size_t i = 0;
+  for (; i + vlmax <= N; i += vlmax) {
+    gelu_erf_grad_block_f32m1(g + i, a + i, b + i, out + i, vlmax);
+  }
+  if (i < N) {
+    const size_t vl = __riscv_vsetvl_e32m1(N - i);
+    gelu_erf_grad_block_f32m1(g + i, a + i, b + i, out + i, vl);
+  }
+}
+
+}  // namespace gelu_erf_grad_rvv
+
+#endif  // defined(__riscv) && defined(__riscv_v)
+
+/*!
+ * \brief Dispatch hook for the optional vectorized float32 gelu_erf_grad
+ *        backward. The generic template reports "unsupported" so callers fall
+ *        back to the scalar kernel; the specialization is enabled only for
+ *        contiguous float32 on RISC-V targets exposing the V extension.
+ * \return true if the vectorized path handled the call, false otherwise.
+ */
+template <typename xpu, typename DType>
+struct gelu_erf_grad_vec {
+  static inline bool Launch(mshadow::Stream<xpu>*,
+                            size_t,
+                            DType*,
+                            const DType*,
+                            const DType*,
+                            const DType*) {
+    return false;
+  }
+};
+
+#if defined(__riscv) && defined(__riscv_v)
+template <>
+struct gelu_erf_grad_vec<mshadow::cpu, float> {
+  static inline bool Launch(mshadow::Stream<mshadow::cpu>*,
+                            size_t N,
+                            float* out,
+                            const float* g,
+                            const float* a,
+                            const float* b) {
+    gelu_erf_grad_rvv::gelu_erf_grad_f32(g, a, b, out, N);
+    return true;
+  }
+};
+#endif  // defined(__riscv) && defined(__riscv_v)
 
 MXNET_UNARY_MATH_OP(gelu_tanh,
                     DType(0.5f * static_cast<float>(a) *
