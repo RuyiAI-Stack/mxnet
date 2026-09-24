@@ -25,6 +25,7 @@
 #define MXNET_OPERATOR_NN_SOFTMAX_INL_H_
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <utility>
 #include <vector>
@@ -33,6 +34,10 @@
 #include "../mxnet_op.h"
 #include "../operator_common.h"
 #include "../tensor/broadcast_reduce_op.h"
+
+#if defined(__riscv) && defined(__riscv_v)
+#include <riscv_vector.h>
+#endif
 
 using mshadow::red::limits::MinValue;
 
@@ -64,6 +69,84 @@ struct log_softmax_fwd {
   }
 };
 
+#if defined(__riscv) && defined(__riscv_v)
+// ---------------------------------------------------------------------------
+// RVV helpers for the CPU Softmax forward fast path (RVV 1.0, SEW=32, LMUL=1).
+// These are used only by the contiguous float32 softmax_fwd hot path; every
+// other case keeps the scalar reference loops in Softmax() below.
+// ---------------------------------------------------------------------------
+
+// Self-contained vectorized exp(x) for vfloat32m1_t (no dependency on any
+// project vector-math library). Range reduced as exp(x) = 2^k * P(r) with
+// k = round(x * log2(e)), r = x - k*ln2 (|r| <= ln2/2) and P a degree-6
+// Taylor polynomial. Softmax only evaluates exp on x = (in - mmax) <= 0, but
+// NaN, -Inf/underflow and out-of-range inputs are handled explicitly so the
+// helper stays well defined.
+static inline vfloat32m1_t softmax_rvv_vexp_f32m1(vfloat32m1_t x, size_t vl) {
+  const float kLog2e        = 1.4426950408889634f;
+  const float kLn2Hi        = 0.693145751953125f;
+  const float kLn2Lo        = 1.42860677e-6f;
+  const float kExpUnderflow = -87.33654475f;  // logf(FLT_MIN)
+
+  const vbool32_t is_nan   = __riscv_vmfne_vv_f32m1_b32(x, x, vl);
+  const vbool32_t is_small = __riscv_vmflt_vf_f32m1_b32(x, kExpUnderflow, vl);
+
+  // Bound the working value so the float->int conversion and the 2^k exponent
+  // construction stay in range. NaN is restored at the end.
+  vfloat32m1_t xc = __riscv_vfmax_vf_f32m1(x, kExpUnderflow, vl);
+  xc              = __riscv_vfmin_vf_f32m1(xc, 88.722839f, vl);
+
+  const vfloat32m1_t kf  = __riscv_vfmul_vf_f32m1(xc, kLog2e, vl);
+  const vint32m1_t   ki  = __riscv_vfcvt_x_f_v_i32m1(kf, vl);
+  const vfloat32m1_t kff = __riscv_vfcvt_f_x_v_f32m1(ki, vl);
+
+  vfloat32m1_t r =
+      __riscv_vfsub_vv_f32m1(xc, __riscv_vfmul_vf_f32m1(kff, kLn2Hi, vl), vl);
+  r = __riscv_vfsub_vv_f32m1(r, __riscv_vfmul_vf_f32m1(kff, kLn2Lo, vl), vl);
+
+  // P(r) = 1 + r + r^2/2 + r^3/6 + r^4/24 + r^5/120 + r^6/720 (Horner).
+  vfloat32m1_t p = __riscv_vfmv_v_f_f32m1(0.001388888888888889f, vl);
+  p = __riscv_vfadd_vf_f32m1(__riscv_vfmul_vv_f32m1(p, r, vl), 0.008333333333333333f, vl);
+  p = __riscv_vfadd_vf_f32m1(__riscv_vfmul_vv_f32m1(p, r, vl), 0.041666666666666664f, vl);
+  p = __riscv_vfadd_vf_f32m1(__riscv_vfmul_vv_f32m1(p, r, vl), 0.16666666666666666f, vl);
+  p = __riscv_vfadd_vf_f32m1(__riscv_vfmul_vv_f32m1(p, r, vl), 0.5f, vl);
+  p = __riscv_vfadd_vf_f32m1(__riscv_vfmul_vv_f32m1(p, r, vl), 1.0f, vl);
+  p = __riscv_vfadd_vf_f32m1(__riscv_vfmul_vv_f32m1(p, r, vl), 1.0f, vl);
+
+  // 2^k built directly from the biased exponent field.
+  const vint32m1_t   bits  = __riscv_vsll_vx_i32m1(__riscv_vadd_vx_i32m1(ki, 127, vl), 23, vl);
+  const vfloat32m1_t scale = __riscv_vreinterpret_v_i32m1_f32m1(bits);
+  vfloat32m1_t res = __riscv_vfmul_vv_f32m1(scale, p, vl);
+
+  res = __riscv_vmerge_vvm_f32m1(res, __riscv_vfmv_v_f_f32m1(0.0f, vl), is_small, vl);
+  res = __riscv_vmerge_vvm_f32m1(res, __riscv_vfmv_v_f_f32m1(NAN, vl), is_nan, vl);
+  return res;
+}
+
+// Store a normalized float32m1 vector into the softmax output. float output is
+// stored directly; half_t output uses the native zvfhmin narrowing conversion
+// when the toolchain exposes it, otherwise it falls back to the scalar mshadow
+// half constructor.
+template <typename OType>
+static inline void softmax_rvv_store_f32m1(OType* out, vfloat32m1_t v, size_t vl) {
+  if constexpr (std::is_same<OType, float>::value) {
+    __riscv_vse32_v_f32m1(out, v, vl);
+  } else if constexpr (std::is_same<OType, mshadow::half::half_t>::value) {
+#if defined(__riscv_zvfhmin) || defined(__riscv_zfhmin)
+    const vfloat16mf2_t h = __riscv_vfncvt_f_f_w_f16mf2(v, vl);
+    __riscv_vse16_v_u16mf2(reinterpret_cast<uint16_t*>(out),
+                           __riscv_vreinterpret_v_f16mf2_u16mf2(h), vl);
+#else
+    float tmp[32];  // VLMAX for SEW=32/LMUL=1 is 32 at VLEN=1024
+    __riscv_vse32_v_f32m1(tmp, v, vl);
+    for (size_t t = 0; t < vl; ++t) {
+      out[t] = OType(tmp[t]);
+    }
+#endif
+  }
+}
+#endif  // defined(__riscv) && defined(__riscv_v)
+
 template <typename OP,
           bool negate,
           typename AType,
@@ -88,6 +171,71 @@ inline void Softmax(Stream<cpu>* s,
   index_t sa         = stride[axis];
 
   if (length == nullptr) {
+#if defined(__riscv) && defined(__riscv_v)
+    // RVV fast path: vectorized 3-pass softmax forward for contiguous float32
+    // input with temperature == 1.0. Every other case falls through to the
+    // scalar reference loops below. The stabilized 3-pass semantics are kept:
+    // subtract the row max, exponentiate, reduce the sum, scale by 1/sum.
+    if constexpr (std::is_same<DType, float>::value &&
+                  std::is_same<OP, softmax_fwd>::value &&
+                  (std::is_same<OType, float>::value ||
+                   std::is_same<OType, mshadow::half::half_t>::value)) {
+      if (temperature == 1.0 && sa == 1) {
+#pragma omp parallel for
+        for (index_t i = 0; i < N; ++i) {
+          const index_t base    = unravel_dot(i, sshape, stride);
+          const float*  in_row  = in + base;
+          OType*        out_row = out + base;
+
+          // Pass 1: max reduction, scalar seed accumulated across blocks.
+          float mmax = negate ? -in_row[0] : in_row[0];
+          for (index_t j = 0; j < M;) {
+            const size_t vl = __riscv_vsetvl_e32m1(static_cast<size_t>(M - j));
+            vfloat32m1_t v  = __riscv_vle32_v_f32m1(in_row + j, vl);
+            if constexpr (negate) {
+              v = __riscv_vfneg_v_f32m1(v, vl);
+            }
+            const vfloat32m1_t seed = __riscv_vfmv_s_f_f32m1(mmax, vl);
+            const vfloat32m1_t red  = __riscv_vfredmax_vs_f32m1_f32m1(v, seed, vl);
+            mmax = __riscv_vfmv_f_s_f32m1_f32(red);
+            j += static_cast<index_t>(vl);
+          }
+
+          // Pass 2: sum of exp(x - mmax), scalar seed accumulated across blocks.
+          float sum = 0.0f;
+          for (index_t j = 0; j < M;) {
+            const size_t vl = __riscv_vsetvl_e32m1(static_cast<size_t>(M - j));
+            vfloat32m1_t v  = __riscv_vle32_v_f32m1(in_row + j, vl);
+            if constexpr (negate) {
+              v = __riscv_vfneg_v_f32m1(v, vl);
+            }
+            v = __riscv_vfsub_vf_f32m1(v, mmax, vl);
+            const vfloat32m1_t e    = softmax_rvv_vexp_f32m1(v, vl);
+            const vfloat32m1_t seed = __riscv_vfmv_s_f_f32m1(sum, vl);
+            const vfloat32m1_t red  = __riscv_vfredusum_vs_f32m1_f32m1(e, seed, vl);
+            sum = __riscv_vfmv_f_s_f32m1_f32(red);
+            j += static_cast<index_t>(vl);
+          }
+
+          // Pass 3: normalize by 1/sum and store.
+          const float inv_sum = 1.0f / sum;
+          for (index_t j = 0; j < M;) {
+            const size_t vl = __riscv_vsetvl_e32m1(static_cast<size_t>(M - j));
+            vfloat32m1_t v  = __riscv_vle32_v_f32m1(in_row + j, vl);
+            if constexpr (negate) {
+              v = __riscv_vfneg_v_f32m1(v, vl);
+            }
+            v = __riscv_vfsub_vf_f32m1(v, mmax, vl);
+            vfloat32m1_t e = softmax_rvv_vexp_f32m1(v, vl);
+            e = __riscv_vfmul_vf_f32m1(e, inv_sum, vl);
+            softmax_rvv_store_f32m1(out_row + j, e, vl);
+            j += static_cast<index_t>(vl);
+          }
+        }
+        return;
+      }
+    }
+#endif
 #pragma omp parallel for
     for (index_t i = 0; i < N; ++i) {
       index_t base = unravel_dot(i, sshape, stride);
