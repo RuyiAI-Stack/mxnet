@@ -254,6 +254,26 @@ else()
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
   endif()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_C_FLAGS}")
+
+  # RISC-V: enable the vector and half-precision extensions available on the
+  # target CPU.  Prefer zfhmin/zvfhmin (native FP16 conversion) and fall back to
+  # the base vector extension when the toolchain does not accept the extras.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "^rv64")
+    include(CheckCCompilerFlag)
+    check_cxx_compiler_flag("-march=rv64gcv_zfhmin_zvfhmin" MXNET_RISCV_HAS_GCV_ZFHMIN)
+    check_c_compiler_flag("-march=rv64gcv_zfhmin_zvfhmin" MXNET_RISCV_HAS_GCV_ZFHMIN_C)
+    if(MXNET_RISCV_HAS_GCV_ZFHMIN AND MXNET_RISCV_HAS_GCV_ZFHMIN_C)
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv64gcv_zfhmin_zvfhmin")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gcv_zfhmin_zvfhmin")
+    else()
+      check_cxx_compiler_flag("-march=rv64gcv" MXNET_RISCV_HAS_GCV)
+      check_c_compiler_flag("-march=rv64gcv" MXNET_RISCV_HAS_GCV_C)
+      if(MXNET_RISCV_HAS_GCV AND MXNET_RISCV_HAS_GCV_C)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv64gcv")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gcv")
+      endif()
+    endif()
+  endif()
 endif()
 
 if(NOT mxnet_LINKER_LIBS)
