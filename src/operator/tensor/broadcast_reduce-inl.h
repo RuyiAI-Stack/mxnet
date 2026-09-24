@@ -32,6 +32,9 @@
 #include "../mshadow_op.h"
 #include "../mxnet_op.h"
 #include "../operator_common.h"
+#if defined(__riscv_v_intrinsic) || defined(__riscv_vector)
+#include <riscv_vector.h>
+#endif
 
 namespace mxnet {
 namespace op {
@@ -298,6 +301,88 @@ MSHADOW_XINLINE void assign(DType* dst, const bool addto, const DType src) {
   }
 }
 
+namespace rvv_reduce {
+
+/*!
+ * \brief RVV kernel selector for the seq_reduce_assign inner k reduction.
+ *
+ * The primary template is disabled, so any reducer without a vector
+ * implementation keeps the scalar loop. Reducers that do have one specialize
+ * this template (minimum below; maximum/nrm2/product can be added alongside
+ * without touching the dispatch site). `Reduce` returns the reduced scalar for
+ * an arithmetic progression of `len` elements starting at `base` with element
+ * stride `stride`, continuing from the scalar accumulator `seed`.
+ */
+template <typename Reducer, typename AType, typename DType>
+struct SeqReduceKernel {
+  static constexpr bool enabled = false;
+  static MSHADOW_XINLINE size_t MinLength() { return 0; }
+  static MSHADOW_XINLINE AType Reduce(const DType* /*base*/,
+                                      ptrdiff_t /*stride*/,
+                                      size_t /*len*/,
+                                      AType seed) {
+    return seed;
+  }
+};
+
+#if defined(__riscv_v_intrinsic) || defined(__riscv_vector)
+
+/*!
+ * \brief RVV 1.0 float32 minimum reduction matching mshadow::red::minimum.
+ *
+ * Reproduces the scalar `Reduce` contract bit-for-bit:
+ *  - NaN propagates: the first NaN in the sequence becomes the result
+ *    (the scalar reducer updates only while `dst` is not NaN);
+ *  - ties keep the earlier element, so for (+0, -0) the sign of the first zero
+ *    is preserved, whereas vfredmin's minNum semantics would always return -0.
+ * The per-chunk minimum combined with its first matching lane is exactly the
+ * first element attaining the running strict minimum, i.e. the scalar result.
+ */
+inline float mshadow_rvv_min_f32(const float* base, ptrdiff_t stride, size_t len, float seed) {
+  float best = seed;
+  size_t off = 0;
+  while (off < len) {
+    const size_t vl = __riscv_vsetvl_e32m1(len - off);
+    const float* p  = base + off * stride;
+    vfloat32m1_t v  = (stride == 1) ?
+                          __riscv_vle32_v_f32m1(p, vl) :
+                          __riscv_vlse32_v_f32m1(p, stride * static_cast<ptrdiff_t>(sizeof(float)), vl);
+    vbool32_t non_nan   = __riscv_vmfeq_vv_f32m1_b32(v, v, vl);
+    const long nan_lane = __riscv_vfirst_m_b32(__riscv_vmnot_m_b32(non_nan, vl), vl);
+    if (nan_lane >= 0) {
+      // First NaN in the sequence: the scalar reducer stops updating afterwards.
+      best = base[(off + static_cast<size_t>(nan_lane)) * stride];
+      return best;
+    }
+    vfloat32m1_t vmin     = __riscv_vfredmin_vs_f32m1_f32m1(v, v, vl);
+    const float chunk_min = __riscv_vfmv_f_s_f32m1_f32(vmin);
+    vbool32_t is_min      = __riscv_vmfeq_vv_f32m1_b32(v, __riscv_vfmv_v_f_f32m1(chunk_min, vl), vl);
+    const long first      = __riscv_vfirst_m_b32(is_min, vl);
+    const float candidate = base[(off + static_cast<size_t>(first)) * stride];
+    if (candidate < best) {
+      best = candidate;
+    }
+    off += vl;
+  }
+  return best;
+}
+
+template <>
+struct SeqReduceKernel<mshadow::red::minimum, float, float> {
+  static constexpr bool enabled = true;
+  static MSHADOW_XINLINE size_t MinLength() { return __riscv_vsetvlmax_e32m1(); }
+  static MSHADOW_XINLINE float Reduce(const float* base,
+                                      ptrdiff_t stride,
+                                      size_t len,
+                                      float seed) {
+    return mshadow_rvv_min_f32(base, stride, len, seed);
+  }
+};
+
+#endif  // defined(__riscv_v_intrinsic) || defined(__riscv_vector)
+
+}  // namespace rvv_reduce
+
 template <int ndim, typename DType, typename OP>
 MSHADOW_XINLINE void binary_broadcast_assign(const index_t idx,
                                              const bool addto,
@@ -361,13 +446,38 @@ MSHADOW_XINLINE void seq_reduce_assign(const index_t idx,
   AType val, residual;
   Reducer::SetInitValue(val, residual);
   if (!use_omp) {
-    for (size_t k = 0; k < M; ++k) {
-      coord      = mxnet_op::unravel(k, rshape);
-      AType temp = OP::Map(big[j + mxnet_op::dot(coord, rstride)]);
-      // argmin/max, set IndexedNum.idx
-      if (IndexOP::do_op)
-        IndexOP::Op(&temp, k);
-      Reducer::Reduce(val, temp, residual);
+    // RVV fast path: only for reducers that provide a vector kernel (minimum
+    // today), for the identity elementwise op, and for a value-only reduction.
+    // It additionally requires the k offsets to form one arithmetic progression
+    // (exactly one reduced axis), which is the shape produced by
+    // BroadcastReduceShapeCompact for the 2-D cases handled here.
+    bool use_rvv = false;
+    if (!IndexOP::do_op && std::is_same<OP, mxnet::op::mshadow_op::identity>::value &&
+        rvv_reduce::SeqReduceKernel<Reducer, AType, DType>::enabled) {
+      int red_dim   = -1;
+      int red_count = 0;
+      for (int d = 0; d < ndim; ++d) {
+        if (rshape[d] != 1) {
+          ++red_count;
+          red_dim = d;
+        }
+      }
+      use_rvv = (red_count == 1) &&
+                (M >= rvv_reduce::SeqReduceKernel<Reducer, AType, DType>::MinLength());
+      if (use_rvv) {
+        val = rvv_reduce::SeqReduceKernel<Reducer, AType, DType>::Reduce(
+            big + j, static_cast<ptrdiff_t>(rstride[red_dim]), M, val);
+      }
+    }
+    if (!use_rvv) {
+      for (size_t k = 0; k < M; ++k) {
+        coord      = mxnet_op::unravel(k, rshape);
+        AType temp = OP::Map(big[j + mxnet_op::dot(coord, rstride)]);
+        // argmin/max, set IndexedNum.idx
+        if (IndexOP::do_op)
+          IndexOP::Op(&temp, k);
+        Reducer::Reduce(val, temp, residual);
+      }
     }
   } else {
     const int thread_count = engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
