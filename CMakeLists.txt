@@ -254,6 +254,23 @@ else()
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
   endif()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_C_FLAGS}")
+  # RISC-V: enable native half-precision conversion (zfhmin/zvfhmin) so the
+  # FP16 softmax output path can emit the native convert instead of the
+  # software float2half bit-manipulation fallback. Fall back to the plain
+  # vector ISA when the toolchain does not accept the zfhmin extensions.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64" OR SYSTEM_ARCHITECTURE MATCHES "riscv64")
+    check_cxx_compiler_flag("-march=rv64gcv_zfhmin_zvfhmin" MXNET_RISCV_HAS_ZFHMIN)
+    if(MXNET_RISCV_HAS_ZFHMIN)
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv64gcv_zfhmin_zvfhmin")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gcv_zfhmin_zvfhmin")
+    else()
+      check_cxx_compiler_flag("-march=rv64gcv" MXNET_RISCV_HAS_V)
+      if(MXNET_RISCV_HAS_V)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv64gcv")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gcv")
+      endif()
+    endif()
+  endif()
 endif()
 
 if(NOT mxnet_LINKER_LIBS)
