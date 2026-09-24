@@ -62,9 +62,18 @@
 
 #include <mxnet/base.h>
 #include <mxnet/operator.h>
+#include <cstddef>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 #include "../mxnet_op.h"
+
+#if defined(__riscv_v_intrinsic) || defined(__riscv_vector)
+#include <riscv_vector.h>
+#define MXNET_IM2COL_USE_RVV 1
+#else
+#define MXNET_IM2COL_USE_RVV 0
+#endif
 
 namespace mxnet {
 namespace op {
@@ -77,6 +86,47 @@ namespace op {
 // The casting allows to use one condition instead of two.
 inline bool is_a_ge_zero_and_a_lt_b(int a, int b) {
   return static_cast<unsigned>(a) < static_cast<unsigned>(b);
+}
+
+/*!
+ * \brief Copy a fixed-stride run of `n` elements from `src` into the
+ *        contiguous `dst`. On RISC-V targets that expose the vector
+ *        extension this uses RVV strided/unit-stride loads and stores;
+ *        on every other target it degrades to the plain scalar loop.
+ *
+ * `stride` is expressed in elements and must be >= 1. The destination is
+ * always contiguous, matching the `data_col` layout produced by im2col.
+ */
+template <typename DType>
+inline void im2col_copy_strided_row(const DType* src, int stride, DType* dst, int n) {
+#if MXNET_IM2COL_USE_RVV
+  if (std::is_same<DType, float>::value) {
+    const float* s = reinterpret_cast<const float*>(src);
+    float* d       = reinterpret_cast<float*>(dst);
+    int i          = 0;
+    if (stride == 1) {
+      while (i < n) {
+        size_t vl = __riscv_vsetvl_e32m1(static_cast<size_t>(n - i));
+        vfloat32m1_t v = __riscv_vle32_v_f32m1(s + i, vl);
+        __riscv_vse32_v_f32m1(d + i, v, vl);
+        i += static_cast<int>(vl);
+      }
+    } else {
+      const ptrdiff_t byte_stride = static_cast<ptrdiff_t>(stride) * static_cast<ptrdiff_t>(sizeof(float));
+      while (i < n) {
+        size_t vl = __riscv_vsetvl_e32m1(static_cast<size_t>(n - i));
+        vfloat32m1_t v =
+            __riscv_vlse32_v_f32m1(s + static_cast<ptrdiff_t>(i) * stride, byte_stride, vl);
+        __riscv_vse32_v_f32m1(d + i, v, vl);
+        i += static_cast<int>(vl);
+      }
+    }
+    return;
+  }
+#endif
+  for (int i = 0; i < n; ++i) {
+    dst[i] = src[static_cast<ptrdiff_t>(i) * stride];
+  }
 }
 
 /*!
@@ -120,14 +170,46 @@ inline void im2col_cpu(const DType* data_im,
               *(data_col++) = 0;
             }
           } else {
-            int input_col = -pad_w + kernel_col * dilation_w;
-            for (int output_col = output_w; output_col; output_col--) {
-              if (is_a_ge_zero_and_a_lt_b(input_col, width)) {
-                *(data_col++) = data_im[input_row * width + input_col];
-              } else {
+            // The input column touched at output position `o` is
+            //   input_col(o) = input_col0 + o * stride_w.
+            // The set of in-range output positions is therefore a single
+            // contiguous interval [o_start, o_end]; everything outside it is
+            // padding and must be written as zero. Splitting the interval out
+            // lets the in-range run be copied with RVV loads/stores instead of
+            // a per-element bounds branch (see im2col_copy_strided_row).
+            const int input_col0 = -pad_w + kernel_col * dilation_w;
+            int o_start          = 0;
+            if (input_col0 < 0) {
+              o_start = (-input_col0 + stride_w - 1) / stride_w;
+            }
+            int o_end = output_w - 1;
+            if (input_col0 + (output_w - 1) * stride_w >= width) {
+              const int last_valid = width - 1 - input_col0;
+              o_end = (last_valid < 0) ? (o_start - 1) : (last_valid / stride_w);
+              if (o_end > output_w - 1) {
+                o_end = output_w - 1;
+              }
+            }
+            if (o_end < o_start) {
+              // No output position maps into the image: the whole row is padding.
+              for (int output_cols = output_w; output_cols; output_cols--) {
                 *(data_col++) = 0;
               }
-              input_col += stride_w;
+            } else {
+              // Left padding.
+              for (int o = 0; o < o_start; ++o) {
+                *(data_col++) = 0;
+              }
+              const int n_valid = o_end - o_start + 1;
+              im2col_copy_strided_row(data_im + input_row * width + input_col0 + o_start * stride_w,
+                                      stride_w,
+                                      data_col,
+                                      n_valid);
+              data_col += n_valid;
+              // Right padding.
+              for (int o = o_end + 1; o < output_w; ++o) {
+                *(data_col++) = 0;
+              }
             }
           }
           input_row += stride_h;
