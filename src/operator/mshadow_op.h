@@ -1981,15 +1981,21 @@ struct nrm2 {
 /*! \brief sum reducer */
 struct sum {
   /*! \brief do reduction into dst */
+  // The accumulators are thread-local stack values; the `volatile` qualifiers
+  // only forced a per-element store/load round-trip (and a store-to-load
+  // forwarding chain through the stack) without providing synchronization.
+  // Dropping them keeps dst/residual in registers. The floating-point
+  // operation sequence is unchanged, so the compensated-summation result is
+  // bit-identical (FLT_EVAL_METHOD == 0 on the target).
   template <typename AType, typename DType>
-  MSHADOW_XINLINE static void Reduce(volatile AType& dst, volatile DType src) {  // NOLINT(*)
+  MSHADOW_XINLINE static void Reduce(AType& dst, DType src) {
     dst += src;
   }
   /*! \brief do stable reduction into dst */
   template <typename AType, typename DType>
-  MSHADOW_XINLINE static void Reduce(volatile AType& dst,         // NOLINT(*)
-                                     volatile DType src,          // NOLINT(*)
-                                     volatile DType& residual) {  // NOLINT(*)
+  MSHADOW_XINLINE static void Reduce(AType& dst,
+                                     DType src,
+                                     DType& residual) {
     DType y  = src - residual;
     DType t  = dst + y;
     residual = (t - dst) - y;
@@ -1997,8 +2003,8 @@ struct sum {
   }
   /*! \brief combine the results of two reducers */
   template <typename DType>
-  MSHADOW_XINLINE static void Merge(volatile DType& dst_val,    // NOLINT(*)
-                                    volatile DType& src_val) {  // NOLINT(*)
+  MSHADOW_XINLINE static void Merge(DType& dst_val,
+                                    DType& src_val) {
     Reduce(dst_val, src_val);
   }
   /*! \brief combine the results of two reducers */
