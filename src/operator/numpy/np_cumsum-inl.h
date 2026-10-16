@@ -27,12 +27,21 @@
 
 #include <mxnet/base.h>
 #include <mxnet/operator_util.h>
+#include <cstddef>
+#include <type_traits>
 #include <vector>
 #include <string>
 #include "../mxnet_op.h"
 #include "../operator_common.h"
 #include "../elemwise_op_common.h"
 #include "../../api/operator/op_utils.h"
+
+#if defined(__riscv_v_intrinsic) || defined(__riscv_vector)
+#include <riscv_vector.h>
+#define MXNET_NP_CUMSUM_USE_RVV 1
+#else
+#define MXNET_NP_CUMSUM_USE_RVV 0
+#endif
 
 namespace mxnet {
 namespace op {
@@ -91,6 +100,61 @@ struct cumsum_forward {
   }
 };
 
+#if MXNET_NP_CUMSUM_USE_RVV
+/*!
+ * \brief RVV cross-lane batched inclusive prefix-sum (cumsum) forward kernel.
+ *
+ * The scalar `cumsum_forward::Map` scans a single lane along `middle` with an
+ * element stride of `trailing`. Lanes that share the same `left` group (i.e.
+ * consecutive `right` indices) are stored at consecutive addresses, so up to
+ * VLMAX of them can be advanced together: a single vector accumulator holds
+ * the running prefix of every lane in the batch. Per lane the additions still
+ * happen strictly in `j = 1 .. middle-1` order (`acc = acc + x`), which is the
+ * exact order used by the scalar reference, so the results are bit-identical
+ * (no reassociation).
+ *
+ * Each `Map` call handles one contiguous chunk of at most VLMAX lanes inside
+ * one `left` group; `Kernel<cpu>::Launch` then spreads the chunks across
+ * OpenMP threads exactly like the scalar path. The scan axis itself is never
+ * re-associated, so `axis=None` / `trailing == 1` shapes keep using the scalar
+ * kernel (there is no second axis to vectorize over).
+ */
+struct cumsum_forward_rvv {
+  MSHADOW_XINLINE static void Map(index_t chunk,
+                                  float* out,
+                                  const float* in,
+                                  const index_t middle,
+                                  const index_t trailing,
+                                  const index_t chunks_per_group) {
+    const size_t vlmax   = __riscv_vsetvlmax_e32m4();
+    const index_t left   = chunk / chunks_per_group;
+    const index_t within = chunk % chunks_per_group;
+    const index_t right  = within * static_cast<index_t>(vlmax);
+    index_t right_end    = right + static_cast<index_t>(vlmax);
+    if (right_end > trailing) {
+      right_end = trailing;
+    }
+    const index_t base = left * middle * trailing + right;
+    const float* in0   = in + base;
+    float* out0        = out + base;
+    index_t i          = right;
+    while (i < right_end) {
+      const size_t vl   = __riscv_vsetvl_e32m4(static_cast<size_t>(right_end - i));
+      const index_t off = i - right;
+      vfloat32m4_t acc  = __riscv_vle32_v_f32m4(in0 + off, vl);
+      __riscv_vse32_v_f32m4(out0 + off, acc, vl);
+      for (index_t j = 1; j < middle; ++j) {
+        const ptrdiff_t stride = static_cast<ptrdiff_t>(j) * static_cast<ptrdiff_t>(trailing);
+        vfloat32m4_t x         = __riscv_vle32_v_f32m4(in0 + off + stride, vl);
+        acc                    = __riscv_vfadd_vv_f32m4(acc, x, vl);
+        __riscv_vse32_v_f32m4(out0 + off + stride, acc, vl);
+      }
+      i += static_cast<index_t>(vl);
+    }
+  }
+};
+#endif  // MXNET_NP_CUMSUM_USE_RVV
+
 template <typename xpu>
 void CumsumForwardImpl(const OpContext& ctx,
                        const TBlob& in,
@@ -116,6 +180,26 @@ void CumsumForwardImpl(const OpContext& ctx,
   Stream<xpu>* s = ctx.get_stream<xpu>();
   MSHADOW_TYPE_SWITCH_WITH_BOOL(in.type_flag_, IType, {
     MSHADOW_TYPE_SWITCH(out.type_flag_, OType, {
+#if MXNET_NP_CUMSUM_USE_RVV
+      if constexpr (std::is_same<xpu, cpu>::value && std::is_same<IType, float>::value &&
+                    std::is_same<OType, float>::value) {
+        if (trailing > 1) {
+          const size_t nlanes            = out.Size() / middle;
+          const size_t vlmax             = __riscv_vsetvlmax_e32m4();
+          const index_t chunks_per_group =
+              static_cast<index_t>((trailing + vlmax - 1) / vlmax);
+          Kernel<cumsum_forward_rvv, xpu>::Launch(
+              s,
+              nlanes / trailing * static_cast<size_t>(chunks_per_group),
+              out.dptr<OType>(),
+              in.dptr<IType>(),
+              middle,
+              trailing,
+              chunks_per_group);
+          return;
+        }
+      }
+#endif
       Kernel<cumsum_forward, xpu>::Launch(
           s, out.Size() / middle, out.dptr<OType>(), in.dptr<IType>(), middle, trailing);
     });
