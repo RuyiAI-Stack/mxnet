@@ -62,9 +62,18 @@
 
 #include <mxnet/base.h>
 #include <mxnet/operator.h>
+#include <cstddef>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 #include "../mxnet_op.h"
+
+#if defined(__riscv_v_intrinsic) || defined(__riscv_vector)
+#include <riscv_vector.h>
+#define MXNET_IM2COL_USE_RVV 1
+#else
+#define MXNET_IM2COL_USE_RVV 0
+#endif
 
 namespace mxnet {
 namespace op {
@@ -77,6 +86,53 @@ namespace op {
 // The casting allows to use one condition instead of two.
 inline bool is_a_ge_zero_and_a_lt_b(int a, int b) {
   return static_cast<unsigned>(a) < static_cast<unsigned>(b);
+}
+
+/*!
+ * \brief Accumulate a fixed-stride run of `n` column elements into `dst`
+ *        (`dst[i * stride] += src[i]`). On RISC-V targets that expose the
+ *        vector extension this uses RVV unit-/strided loads and stores;
+ *        on every other target it degrades to the plain scalar loop.
+ *
+ * `stride` is expressed in elements and must be >= 1. Because stride >= 1,
+ * the lane addresses are pairwise distinct, so the vector accumulate is
+ * element-wise identical to the scalar loop: every `dst` element still
+ * receives the same per-tap `+=` in the same order (no cross-lane
+ * reassociation and no change of the FP accumulation semantics).
+ */
+template <typename DType>
+inline void col2im_accumulate_strided_row(const DType* src, DType* dst, int stride, int n) {
+#if MXNET_IM2COL_USE_RVV
+  if (std::is_same<DType, float>::value) {
+    const float* s = reinterpret_cast<const float*>(src);
+    float* d       = reinterpret_cast<float*>(dst);
+    int i          = 0;
+    if (stride == 1) {
+      while (i < n) {
+        size_t vl       = __riscv_vsetvl_e32m4(static_cast<size_t>(n - i));
+        vfloat32m4_t vc = __riscv_vle32_v_f32m4(s + i, vl);
+        vfloat32m4_t vd = __riscv_vle32_v_f32m4(d + i, vl);
+        __riscv_vse32_v_f32m4(d + i, __riscv_vfadd_vv_f32m4(vd, vc, vl), vl);
+        i += static_cast<int>(vl);
+      }
+    } else {
+      const ptrdiff_t byte_stride =
+          static_cast<ptrdiff_t>(stride) * static_cast<ptrdiff_t>(sizeof(float));
+      while (i < n) {
+        const ptrdiff_t offset = static_cast<ptrdiff_t>(i) * stride;
+        size_t vl              = __riscv_vsetvl_e32m4(static_cast<size_t>(n - i));
+        vfloat32m4_t vc        = __riscv_vle32_v_f32m4(s + i, vl);
+        vfloat32m4_t vd        = __riscv_vlse32_v_f32m4(d + offset, byte_stride, vl);
+        __riscv_vsse32_v_f32m4(d + offset, byte_stride, __riscv_vfadd_vv_f32m4(vd, vc, vl), vl);
+        i += static_cast<int>(vl);
+      }
+    }
+    return;
+  }
+#endif
+  for (int i = 0; i < n; ++i) {
+    dst[static_cast<ptrdiff_t>(i) * stride] += src[i];
+  }
 }
 
 /*!
@@ -312,20 +368,43 @@ inline void col2im_cpu(const DType* data_col,
   for (int channel = channels; channel--; data_im += channel_size) {
     for (int kernel_row = 0; kernel_row < kernel_h; kernel_row++) {
       for (int kernel_col = 0; kernel_col < kernel_w; kernel_col++) {
-        int input_row = -pad_h + kernel_row * dilation_h;
-        for (int output_rows = output_h; output_rows; output_rows--) {
-          if (!is_a_ge_zero_and_a_lt_b(input_row, height)) {
-            data_col += output_w;
-          } else {
-            int input_col = -pad_w + kernel_col * dilation_w;
-            for (int output_col = output_w; output_col; output_col--) {
-              if (is_a_ge_zero_and_a_lt_b(input_col, width)) {
-                data_im[input_row * width + input_col] += *data_col;
-              }
-              data_col++;
-              input_col += stride_w;
-            }
+        // The input column touched at output position `o` is
+        //   input_col(o) = input_col0 + o * stride_w.
+        // Only positions with 0 <= input_col(o) < width contribute to the
+        // image; because stride_w >= 1 that set is a single contiguous
+        // interval [o_start, o_end]. Padding positions contribute nothing, so
+        // they are skipped by only advancing the column pointer (no
+        // out-of-bounds pointer construction and no per-element bounds
+        // branch). The in-range run is accumulated with RVV loads/stores
+        // (see col2im_accumulate_strided_row).
+        const int input_col0 = -pad_w + kernel_col * dilation_w;
+        int o_start          = 0;
+        if (input_col0 < 0) {
+          o_start = (-input_col0 + stride_w - 1) / stride_w;
+        }
+        int o_end = output_w - 1;
+        if (input_col0 + (output_w - 1) * stride_w >= width) {
+          const int last_valid = width - 1 - input_col0;
+          o_end = (last_valid < 0) ? (o_start - 1) : (last_valid / stride_w);
+          if (o_end > output_w - 1) {
+            o_end = output_w - 1;
           }
+        }
+        const int n_valid = (o_end >= o_start) ? (o_end - o_start + 1) : 0;
+        int input_row     = -pad_h + kernel_row * dilation_h;
+        for (int output_rows = output_h; output_rows; output_rows--) {
+          if (n_valid > 0 && is_a_ge_zero_and_a_lt_b(input_row, height)) {
+            col2im_accumulate_strided_row(
+                data_col + o_start,
+                data_im + input_row * width + input_col0 + o_start * stride_w,
+                stride_w,
+                n_valid);
+          }
+          // The column buffer is laid out [kernel_col][output_row][output_col];
+          // every output position consumes exactly one column entry, so the
+          // pointer advance is independent of whether the position was
+          // in-range or padding.
+          data_col += output_w;
           input_row += stride_h;
         }
       }
