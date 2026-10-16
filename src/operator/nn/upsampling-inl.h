@@ -83,6 +83,49 @@ struct UpSamplingParam : public dmlc::Parameter<UpSamplingParam> {
   }
 };  // struct UpSamplingParam
 
+/*!
+ * \brief Try to run the RVV 1.0 nearest-neighbour upsampling fast path.
+ *        The generic template is a no-op so that non-RVV builds and non-float
+ *        / non-CPU instantiations keep the original expression path unchanged.
+ *        The <cpu, float> specialization is only compiled when RVV is enabled.
+ */
+template <typename xpu, typename DType>
+inline bool UpSamplingNearestTryRVV(const mshadow::Tensor<xpu, 4, DType>& data,
+                                    mshadow::Tensor<xpu, 4, DType>& out,
+                                    const std::vector<OpReqType>& req,
+                                    int scale) {
+  return false;
+}
+
+#if defined(__riscv_v_intrinsic) || defined(__riscv_vector)
+template <>
+inline bool UpSamplingNearestTryRVV<mshadow::cpu, float>(
+    const mshadow::Tensor<mshadow::cpu, 4, float>& data,
+    mshadow::Tensor<mshadow::cpu, 4, float>& out,
+    const std::vector<OpReqType>& req,
+    int scale) {
+  if (req[up_enum::kOut] != kWriteTo || scale < 1) {
+    return false;
+  }
+  if (!out.CheckContiguous() || !data.CheckContiguous()) {
+    return false;
+  }
+  const mshadow::index_t s = static_cast<mshadow::index_t>(scale);
+  if (out.size(0) != data.size(0) || out.size(1) != data.size(1) ||
+      out.size(2) != data.size(2) * s || out.size(3) != data.size(3) * s) {
+    return false;
+  }
+  // Keep the u32 byte offsets from overflowing; absurd widths fall back.
+  if (data.size(3) > (static_cast<mshadow::index_t>(1) << 30)) {
+    return false;
+  }
+  mshadow::expr::mshadow_rvv_upsampling_nearest_f32(
+      data.dptr_, out.dptr_, data.size(0) * data.size(1), data.size(2),
+      data.size(3), s);
+  return true;
+}
+#endif  // defined(__riscv_v_intrinsic) || defined(__riscv_vector)
+
 template <typename xpu, typename DType>
 void UpSamplingForward(const OpContext& ctx,
                        const UpSamplingParam& param,
@@ -117,6 +160,9 @@ void UpSamplingForward(const OpContext& ctx,
     }
   } else {
     Tensor<xpu, 4, DType> data = in_data[up_enum::kData].get<xpu, 4, DType>(s);
+    if (UpSamplingNearestTryRVV<xpu, DType>(data, out, req, param.scale)) {
+      return;
+    }
     Assign(out, req[up_enum::kOut], upsampling_nearest(data, param.scale));
   }
 }
