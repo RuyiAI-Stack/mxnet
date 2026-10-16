@@ -33,6 +33,10 @@
 #include "./operator_tune.h"
 #include "./contrib/erfinv-inl.h"
 
+#if defined(__riscv) && defined(__riscv_v)
+#include <riscv_vector.h>
+#endif
+
 #ifdef __CUDACC__
 #include <cuda_fp16.h>
 #endif
@@ -1711,6 +1715,79 @@ struct relu_grad : public mxnet_op::tunable {
   }
 };
 
+#if defined(__riscv) && defined(__riscv_v)
+/*!
+ * \brief RVV (RISC-V Vector 1.0) branch-free float32 fast path for the
+ *        lane-independent ReLU backward kernel
+ *        `out[i] = lhs[i] * relu_grad(rhs[i])` with
+ *        `relu_grad(a) = IsNan(a) ? a : (a > 0 ? 1 : 0)`.
+ *
+ * The scalar `relu_grad::Map` above is compiled per element into two scalar
+ * compares (`feq.s` NaN check + `flt.s` sign check), two branches
+ * (`beqz`/`bnez`) and three memory/pointer operations; on RVV-capable hardware
+ * the whole loop stays scalar, so RVV compare/mask/select never participate.
+ * This path replaces the per-element compares/branches with RVV compare masks
+ * and `vmerge` selects while keeping the exact same semantics:
+ *   - NaN lanes return the input `x` unchanged (payload preserved, matching
+ *     `IsNan(a) -> a`) and are then multiplied by `lhs`;
+ *   - `x > 0` (including +Inf) maps to 1, `x <= 0` (including -0.0f and -Inf)
+ *     maps to 0;
+ *   - the `lhs * m` operand order and the resulting sign of zero are identical
+ *     to the scalar `DType(a * GRAD_OP::Map(...))`.
+ */
+namespace relu_grad_rvv {
+
+/*!
+ * \brief Process one contiguous block of `vl` float32 elements.
+ * \tparam accumulate true for kAddTo (out += lhs * relu_grad(rhs)), false for
+ *         the plain write requests.
+ */
+template <bool accumulate>
+MSHADOW_XINLINE void relu_grad_block_f32m1(float* out,
+                                           const float* lhs,
+                                           const float* rhs,
+                                           size_t vl) {
+  const vfloat32m1_t x = __riscv_vle32_v_f32m1(rhs, vl);
+  const vfloat32m1_t g = __riscv_vle32_v_f32m1(lhs, vl);
+  /* a > 0 -> 1, otherwise 0 (the `a > DType(0)` arm of the scalar Map). */
+  const vbool32_t gt = __riscv_vmfgt_vf_f32m1_b32(x, 0.0f, vl);
+  vfloat32m1_t m = __riscv_vmerge_vvm_f32m1(__riscv_vfmv_v_f_f32m1(0.0f, vl),
+                                            __riscv_vfmv_v_f_f32m1(1.0f, vl), gt, vl);
+  /* IsNan(a) -> a: vmfne(x, x) is true exactly for NaN lanes, and vmerge
+   * copies the original x bits so the NaN payload is preserved. */
+  const vbool32_t nan = __riscv_vmfne_vv_f32m1_b32(x, x, vl);
+  m = __riscv_vmerge_vvm_f32m1(m, x, nan, vl);
+  vfloat32m1_t res = __riscv_vfmul_vv_f32m1(g, m, vl);
+  if (accumulate) {
+    res = __riscv_vfadd_vv_f32m1(res, __riscv_vle32_v_f32m1(out, vl), vl);
+  }
+  __riscv_vse32_v_f32m1(out, res, vl);
+}
+
+/*!
+ * \brief Apply the vectorized ReLU backward over a contiguous float32 range.
+ *        Fixed-VL main loop + runtime-VL tail, so there is never an over-read
+ *        or over-write.
+ */
+template <bool accumulate>
+MSHADOW_XINLINE void relu_grad_apply_range(float* out,
+                                           const float* lhs,
+                                           const float* rhs,
+                                           size_t n) {
+  const size_t vlmax = __riscv_vsetvlmax_e32m1();
+  size_t i = 0;
+  for (; i + vlmax <= n; i += vlmax) {
+    relu_grad_block_f32m1<accumulate>(out + i, lhs + i, rhs + i, vlmax);
+  }
+  if (i < n) {
+    const size_t vl = __riscv_vsetvl_e32m1(n - i);
+    relu_grad_block_f32m1<accumulate>(out + i, lhs + i, rhs + i, vl);
+  }
+}
+
+}  // namespace relu_grad_rvv
+#endif  // defined(__riscv) && defined(__riscv_v)
+
 /*! \brief used for computing binary operator maximum */
 struct maximum : public mxnet_op::tunable {
   template <typename DType>
@@ -2308,4 +2385,87 @@ struct lcm : public mxnet_op::tunable {
 }  // namespace mshadow_op
 }  // namespace op
 }  // namespace mxnet
+#if defined(__riscv) && defined(__riscv_v)
+namespace mxnet {
+namespace op {
+namespace mxnet_op {
+
+/*!
+ * \brief RVV-vectorized CPU launch for the ReLU backward kernel.
+ *
+ * Specializes the generic Kernel for
+ * op_with_req<backward_grad_tuned<mshadow_op::relu_grad>, req> so that the
+ * contiguous float32 path runs through the branch-free RVV mask/select kernel
+ * instead of the scalar per-element feq.s/flt.s compares and beqz/bnez branches.
+ * Every other dtype/signature keeps the original scalar LaunchTuned body via
+ * the variadic fallback.
+ */
+template <int req>
+struct Kernel<op_with_req<backward_grad_tuned<mshadow_op::relu_grad>, req>, mshadow::cpu> {
+  typedef op_with_req<backward_grad_tuned<mshadow_op::relu_grad>, req> op_type;
+
+  /*! \brief Scalar fallback for non-float32 / other signatures. */
+  template <typename DType, typename... Args>
+  inline static bool Launch(mshadow::Stream<mshadow::cpu>*,
+                            const size_t N,
+                            DType* out,
+                            Args... args) {
+#ifdef _OPENMP
+    const int omp_threads = engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
+    if (omp_threads < 2 ||
+        !tuned_op<typename op_type::Operation, DType>::UseOMP(
+            N, static_cast<size_t>(omp_threads))) {
+      for (size_t i = 0; i < N; ++i) {
+        op_type::Map(i, out, args...);
+      }
+    } else {
+#pragma omp parallel for num_threads(omp_threads)
+      for (index_t i = 0; i < static_cast<index_t>(N); ++i) {
+        op_type::Map(i, out, args...);
+      }
+    }
+#else
+    for (size_t i = 0; i < N; ++i) {
+      op_type::Map(i, out, args...);
+    }
+#endif
+    return true;
+  }
+
+  /*! \brief Contiguous float32 path: branch-free RVV mask/select kernel. */
+  inline static bool Launch(mshadow::Stream<mshadow::cpu>*,
+                            const size_t N,
+                            float* out,
+                            float* lhs,
+                            float* rhs) {
+    if (N == 0 || req == kNullOp) {
+      return true;
+    }
+#ifdef _OPENMP
+    // Keep OpenMP only for ranges large enough to amortize its launch cost,
+    // mirroring the intent of the tuned_op::UseOMP workload threshold.
+    const int omp_threads = engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
+    if (omp_threads >= 2 && N >= 4096) {
+      const size_t chunk =
+          (N + static_cast<size_t>(omp_threads) - 1) / static_cast<size_t>(omp_threads);
+#pragma omp parallel for num_threads(omp_threads)
+      for (index_t i = 0; i < static_cast<index_t>(N); i += static_cast<index_t>(chunk)) {
+        const size_t start = static_cast<size_t>(i);
+        const size_t len   = (start + chunk > N) ? (N - start) : chunk;
+        mshadow_op::relu_grad_rvv::relu_grad_apply_range<(req == kAddTo)>(
+            out + start, lhs + start, rhs + start, len);
+      }
+      return true;
+    }
+#endif
+    mshadow_op::relu_grad_rvv::relu_grad_apply_range<(req == kAddTo)>(out, lhs, rhs, N);
+    return true;
+  }
+};
+
+}  // namespace mxnet_op
+}  // namespace op
+}  // namespace mxnet
+#endif  // defined(__riscv) && defined(__riscv_v)
+
 #endif  // MXNET_OPERATOR_MSHADOW_OP_H_
